@@ -1,0 +1,78 @@
+# =====================================================
+# TaSProject Docker Compose 構成定義
+# 起動方法: docker compose up --build -d
+# 停止方法: docker compose down
+# 完全初期化: docker compose down -v (DB永続データ削除)
+# =====================================================
+
+services:
+  # -------------------------------------------------
+  # PostgreSQL 16 データベース
+  # 初回起動時に db/init/ 配下のSQLを自動実行する
+  # -------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: quotes-db
+    environment:
+      POSTGRES_DB: quotesdb
+      POSTGRES_USER: ${DB_USERNAME:-quoteuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-quotepassword}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-quoteuser} -d quotesdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - quote-network
+
+  # -------------------------------------------------
+  # Spring Boot バックエンド API
+  # DB が healthy になってから起動する
+  # -------------------------------------------------
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: quotes-backend
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker
+      - DB_USERNAME=${DB_USERNAME:-quoteuser}
+      - DB_PASSWORD=${DB_PASSWORD:-quotepassword}
+      - JWT_SECRET=${JWT_SECRET:-dGhlLXNlY3JldC1rZXktZm9yLWF1dG9tb2JpbGUtaW5zdXJhbmNlLXF1b3RlLXN5c3RlbS1kZXYtMjAyNjA2Mjk=}
+      - JWT_EXPIRATION=${JWT_EXPIRATION:-86400000}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - quote-network
+
+  # -------------------------------------------------
+  # React フロントエンド (Nginx リバースプロキシ)
+  # /api/* へのリクエストを backend へ転送する
+  # -------------------------------------------------
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: quotes-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - quote-network
+
+networks:
+  quote-network:
+    driver: bridge
+
+# 【永続化設計】Named Volume により、コンテナ再作成後もDBデータが保持される
+volumes:
+  postgres-data:

@@ -1,0 +1,52 @@
+spring:
+  profiles:
+    active: dev
+  application:
+    name: quote-system
+  cache:
+    type: simple
+
+# JWT設定: Secret keyはBase64エンコード済み（256bit以上必須）
+# 本番環境では必ず環境変数 JWT_SECRET で上書きすること
+jwt:
+  secret: ${JWT_SECRET:dGhlLXNlY3JldC1rZXktZm9yLWF1dG9tb2JpbGUtaW5zdXJhbmNlLXF1b3RlLXN5c3RlbS1kZXYtMjAyNjA2Mjk=}
+  expiration: ${JWT_EXPIRATION:86400000} # デフォルト24時間（ミリ秒）
+
+---
+spring:
+  config:
+    activate:
+      on-profile: dev
+  datasource:
+    # 【ローカル開発用】接続先は環境変数で切り替え可能。未設定時はローカルPostgreSQLへ接続する。
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/quotesdb}
+    username: ${DB_USERNAME:quoteuser}
+    password: ${DB_PASSWORD:quotepassword}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+  datasource:
+    # 【Docker Compose用】サービス名 "db" でPostgreSQLコンテナへ接続する
+    url: jdbc:postgresql://db:5432/quotesdb
+    username: ${DB_USERNAME:quoteuser}
+    password: ${DB_PASSWORD:quotepassword}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: none
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
