@@ -47,116 +47,121 @@ public class QuoteService {
     /**
      * 新規見積を作成する
      * 【設計考量】ユーザー入力条件に基づき基本保険料(50,000円)から各係数を乗算・加算し、日本円決済要件に適合させるため10円単位で四捨五入して永続化する。
+     * 【DRY・単一責任原則】メソッド単体の長さを30行以内に抑えるため、乗算処理、加算処理、エンティティ構築をそれぞれ専用の非公開メソッドに分離する。
      */
     @Transactional
     public QuoteResponse createQuote(QuoteRequest request) {
-        // 1. 保険料の計算と内訳の組み立て
         List<QuoteBreakdown> breakdowns = new ArrayList<>();
-        BigDecimal currentPremium = BigDecimal.valueOf(50000); // 基本保険料
-        int displayOrder = 1;
 
-        // a. 年齢区分
-        String ageCode = getAgeCode(request.getDriverAge());
-        RateMaster ageRate = getRateMasterFromDb("AGE", ageCode);
-        currentPremium = currentPremium.multiply(ageRate.getRate());
-        breakdowns.add(createBreakdown(ageRate, displayOrder++));
+        // 1. 各種料率（乗算）の適用
+        BigDecimal currentPremium = applyMultipliers(request, breakdowns);
 
-        // b. 免許証色
-        RateMaster licenseRate = getRateMasterFromDb("LICENSE", request.getLicenseColor());
-        currentPremium = currentPremium.multiply(licenseRate.getRate());
-        breakdowns.add(createBreakdown(licenseRate, displayOrder++));
+        // 2. 加算項目（特約・補償）の集計
+        int additionsSum = sumAdditions(request, breakdowns);
 
-        // c. 使用目的
-        RateMaster usageRate = getRateMasterFromDb("USAGE", request.getUsageType());
-        currentPremium = currentPremium.multiply(usageRate.getRate());
-        breakdowns.add(createBreakdown(usageRate, displayOrder++));
+        // 3. 年間保険料・月額保険料の端数処理（10円未満四捨五入）
+        int annualPremium = roundPremium(currentPremium.add(BigDecimal.valueOf(additionsSum)));
+        int monthlyPremium = roundPremium(BigDecimal.valueOf(annualPremium).divide(BigDecimal.valueOf(12), 2, RoundingMode.HALF_UP));
 
-        // d. 走行距離
-        String mileageCode = getMileageCode(request.getAnnualMileage());
-        RateMaster mileageRate = getRateMasterFromDb("MILEAGE", mileageCode);
-        currentPremium = currentPremium.multiply(mileageRate.getRate());
-        breakdowns.add(createBreakdown(mileageRate, displayOrder++));
+        // 4. 見積エンティティの組み立て・永続化およびDTO変換
+        Quote quote = buildQuoteEntity(request, generateQuoteNo(), annualPremium, monthlyPremium, breakdowns);
+        Quote savedQuote = quoteRepository.save(quote);
 
-        // e. 運転者範囲
-        RateMaster rangeRate = getRateMasterFromDb("RANGE", request.getDriverRange());
-        currentPremium = currentPremium.multiply(rangeRate.getRate());
-        breakdowns.add(createBreakdown(rangeRate, displayOrder++));
+        return convertToResponse(savedQuote);
+    }
 
-        // f. 等級 (現在加入ありの場合のみ)
-        if (Boolean.TRUE.equals(request.getHasCurrentInsurance()) && request.getGrade() != null) {
-            String gradeCode = getGradeCode(request.getGrade());
-            RateMaster gradeRate = getRateMasterFromDb("GRADE", gradeCode);
-            currentPremium = currentPremium.multiply(gradeRate.getRate());
-            breakdowns.add(createBreakdown(gradeRate, displayOrder++));
+    /**
+     * 【設計意図】見積計算におけるすべての乗算係数（年齢、免許証色、目的、距離、範囲、等級、事故有、車両）を順次適用する。
+     */
+    private BigDecimal applyMultipliers(QuoteRequest request, List<QuoteBreakdown> breakdowns) {
+        BigDecimal premium = BigDecimal.valueOf(50000);
+        int order = 1;
+
+        // 年齢、免許証色、使用目的
+        premium = applyMultiplier(premium, "AGE", getAgeCode(request.getDriverAge()), breakdowns, order++);
+        premium = applyMultiplier(premium, "LICENSE", request.getLicenseColor(), breakdowns, order++);
+        premium = applyMultiplier(premium, "USAGE", request.getUsageType(), breakdowns, order++);
+
+        // 走行距離、運転者範囲
+        premium = applyMultiplier(premium, "MILEAGE", getMileageCode(request.getAnnualMileage()), breakdowns, order++);
+        premium = applyMultiplier(premium, "RANGE", request.getDriverRange(), breakdowns, order++);
+
+        // 等級・事故有（加入ありの場合のみ）
+        if (Boolean.TRUE.equals(request.getHasCurrentInsurance())) {
+            if (request.getGrade() != null) {
+                premium = applyMultiplier(premium, "GRADE", getGradeCode(request.getGrade()), breakdowns, order++);
+            }
+            if (request.getAccidentTerm() != null && request.getAccidentTerm() >= 1) {
+                premium = applyMultiplier(premium, "ACCIDENT", "TERM_1_UP", breakdowns, order++);
+            }
         }
 
-        // g. 事故有係数期間 (現在加入あり且つ1年以上の場合のみ)
-        if (Boolean.TRUE.equals(request.getHasCurrentInsurance()) && request.getAccidentTerm() != null && request.getAccidentTerm() >= 1) {
-            RateMaster accidentRate = getRateMasterFromDb("ACCIDENT", "TERM_1_UP");
-            currentPremium = currentPremium.multiply(accidentRate.getRate());
-            breakdowns.add(createBreakdown(accidentRate, displayOrder++));
-        }
+        // 車両タイプ
+        premium = applyMultiplier(premium, "VEHICLE_TYPE", request.getVehicleType(), breakdowns, order++);
 
-        // h. 車両タイプ
-        RateMaster vehicleRate = getRateMasterFromDb("VEHICLE_TYPE", request.getVehicleType());
-        currentPremium = currentPremium.multiply(vehicleRate.getRate());
-        breakdowns.add(createBreakdown(vehicleRate, displayOrder++));
+        return premium;
+    }
 
-        // 乗算完了後の基本額に対して、加算項目を追加する
-        int additionsSum = 0;
+    /**
+     * 【DRY設計】個別マスタデータを取得し、保険料に乗算した上で計算明細リストに追加する。
+     */
+    private BigDecimal applyMultiplier(BigDecimal premium, String category, String itemCode, List<QuoteBreakdown> breakdowns, int order) {
+        RateMaster master = getRateMasterFromDb(category, itemCode);
+        breakdowns.add(createBreakdown(master, order));
+        return premium.multiply(master.getRate());
+    }
 
-        // i. 車両保険
+    /**
+     * 【設計意図】特約や車両保険などの定額加算項目を集計し、明細リストに追加する。
+     */
+    private int sumAdditions(QuoteRequest request, List<QuoteBreakdown> breakdowns) {
+        int sum = 0;
+        int order = breakdowns.size() + 1;
+
         if (Boolean.TRUE.equals(request.getVehicleInsurance())) {
-            RateMaster covVeh = getRateMasterFromDb("COVERAGE", "VEHICLE_INSURANCE_TRUE");
-            additionsSum += covVeh.getAmount();
-            breakdowns.add(createBreakdown(covVeh, displayOrder++));
+            sum += getAdditionAmount("COVERAGE", "VEHICLE_INSURANCE_TRUE", breakdowns, order++);
         }
-
-        // j. 对物补偿 (無制限のみ加算)
         if ("UNLIMITED".equals(request.getPropertyDamageLimit())) {
-            RateMaster covProp = getRateMasterFromDb("COVERAGE", "PROPERTY_DAMAGE_UNLIMITED");
-            additionsSum += covProp.getAmount();
-            breakdowns.add(createBreakdown(covProp, displayOrder++));
+            sum += getAdditionAmount("COVERAGE", "PROPERTY_DAMAGE_UNLIMITED", breakdowns, order++);
         }
 
-        // k. 人身傷害 (5000万 / 無制限 のみ加算)
+        // 人身傷害
         if ("FIFTY_MILLION".equals(request.getPersonalInjuryAmount())) {
-            RateMaster covPers = getRateMasterFromDb("COVERAGE", "PERSONAL_INJURY_50M");
-            additionsSum += covPers.getAmount();
-            breakdowns.add(createBreakdown(covPers, displayOrder++));
+            sum += getAdditionAmount("COVERAGE", "PERSONAL_INJURY_50M", breakdowns, order++);
         } else if ("UNLIMITED".equals(request.getPersonalInjuryAmount())) {
-            RateMaster covPers = getRateMasterFromDb("COVERAGE", "PERSONAL_INJURY_UNLIMITED");
-            additionsSum += covPers.getAmount();
-            breakdowns.add(createBreakdown(covPers, displayOrder++));
+            sum += getAdditionAmount("COVERAGE", "PERSONAL_INJURY_UNLIMITED", breakdowns, order++);
         }
 
-        // l. 弁護士特約
         if (Boolean.TRUE.equals(request.getLawyerOption())) {
-            RateMaster covLaw = getRateMasterFromDb("COVERAGE", "LAWYER_OPTION_TRUE");
-            additionsSum += covLaw.getAmount();
-            breakdowns.add(createBreakdown(covLaw, displayOrder++));
+            sum += getAdditionAmount("COVERAGE", "LAWYER_OPTION_TRUE", breakdowns, order++);
         }
-
-        // m. ロードサービス
         if (Boolean.TRUE.equals(request.getRoadService())) {
-            RateMaster covRoad = getRateMasterFromDb("COVERAGE", "ROAD_SERVICE_TRUE");
-            additionsSum += covRoad.getAmount();
-            breakdowns.add(createBreakdown(covRoad, displayOrder++));
+            sum += getAdditionAmount("COVERAGE", "ROAD_SERVICE_TRUE", breakdowns, order++);
         }
 
-        // 年間保険料の計算：乗算後価格 + 加算合計。10円未満を四捨五入する
-        BigDecimal finalAnnualPremium = currentPremium.add(BigDecimal.valueOf(additionsSum));
-        // setScale(-1) で10の位に丸める（個の位を四捨五入）
-        BigDecimal roundedAnnual = finalAnnualPremium.setScale(-1, RoundingMode.HALF_UP);
+        return sum;
+    }
 
-        // 月額保険料の計算：年間保険料 ÷ 12。10円未満を四捨五入する
-        BigDecimal rawMonthly = roundedAnnual.divide(BigDecimal.valueOf(12), 2, RoundingMode.HALF_UP);
-        BigDecimal roundedMonthly = rawMonthly.setScale(-1, RoundingMode.HALF_UP);
+    /**
+     * 【DRY設計】加算項目マスタを取得し、金額を返却するとともに計算明細リストに追加する。
+     */
+    private int getAdditionAmount(String category, String itemCode, List<QuoteBreakdown> breakdowns, int order) {
+        RateMaster master = getRateMasterFromDb(category, itemCode);
+        breakdowns.add(createBreakdown(master, order));
+        return master.getAmount();
+    }
 
-        // 2. 見積番号の採番
-        String quoteNo = generateQuoteNo();
+    /**
+     * 【精度設計】日本円の最小通貨単位（端数）処理として、10円未満を四捨五入する。
+     */
+    private int roundPremium(BigDecimal premium) {
+        return premium.setScale(-1, RoundingMode.HALF_UP).intValue();
+    }
 
-        // 3. エンティティの組み立てと保存
+    /**
+     * 【設計意図】見積ヘッダのエンティティオブジェクトを組み立てる。
+     */
+    private Quote buildQuoteEntity(QuoteRequest request, String quoteNo, int annual, int monthly, List<QuoteBreakdown> breakdowns) {
         Quote quote = Quote.builder()
                 .quoteNo(quoteNo)
                 .driverAge(request.getDriverAge())
@@ -172,20 +177,14 @@ public class QuoteService {
                 .firstRegistrationYm(request.getFirstRegistrationYearMonth())
                 .vehicleType(request.getVehicleType())
                 .vehicleInsurance(request.getVehicleInsurance())
-                .annualPremium(roundedAnnual.intValue())
-                .monthlyPremium(roundedMonthly.intValue())
+                .annualPremium(annual)
+                .monthlyPremium(monthly)
                 .build();
 
-        // 内訳とのリレーション設定
-        for (QuoteBreakdown b : breakdowns) {
-            quote.addBreakdown(b);
-        }
-
-        Quote savedQuote = quoteRepository.save(quote);
-
-        // DTOへの変換
-        return convertToResponse(savedQuote);
+        breakdowns.forEach(quote::addBreakdown);
+        return quote;
     }
+
 
     /**
      * 見積番号で検索し、見積結果を取得する
